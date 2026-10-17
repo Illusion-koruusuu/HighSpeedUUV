@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "highspeed-uuv"
+version = "1.0.0"
+description = "HoloOcean Torpedo Fossen UUV navigation with Dijkstra-v5 PPO shaping"
+requires-python = ">=3.10"
+dependencies = ["numpy", "gymnasium", "matplotlib"]
+
+[project.optional-dependencies]
+train = ["stable-baselines3==2.9.0", "torch"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["highspeed_uuv*", "training*"]
