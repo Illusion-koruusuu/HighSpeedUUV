@@ -21,5 +21,11 @@ python -m training.train --timesteps 1000000 --output runs/ppo_dijkstra_v5
 python -m training.evaluate runs/ppo_dijkstra_v5/ppo_dijkstra.zip --output runs/ppo_test
 ```
 
+默认每回合随机生成 2～5 个障碍物；可用 `--min-obstacles` 和
+`--max-obstacles` 修改训练范围，评估时使用同名参数。障碍物中心和半径独立随机，
+不同障碍物之间允许重叠。
+
 `z` 是 NED 深度坐标，正方向向下。Dijkstra 规划区域固定为
-`x[-20,100]、y[-70,70]、z[0,40]`，越界立即结束回合并处罚。
+`x[-20,100]、y[-70,70]、z[0,40]`，越界立即结束回合并处罚。当前目标捕获球半径为
+6 m；目标附近的残差只在无障碍时提前保持转弯所需的推进，并按目标方位修正舵向，
+远距离路径规划和避障仍由 PPO 控制。

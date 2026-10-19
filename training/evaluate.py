@@ -16,11 +16,11 @@ from highspeed_uuv.vehicle_profile import (DEFAULT_PROFILE, FIN_MAPPING_VERSION,
                                            STANDARD_PROFILE)
 
 
-def make_env(episode_steps, obstacle_count, goal_guidance,
-             vehicle_profile=DEFAULT_PROFILE):
+def make_env(episode_steps, goal_guidance, vehicle_profile=DEFAULT_PROFILE,
+             obstacle_count_range=(2, 5)):
     kwargs = dict(
         max_steps=episode_steps,
-        obstacle_count=obstacle_count,
+        obstacle_count_range=obstacle_count_range,
         goal_guidance=goal_guidance,
     )
     kwargs['vehicle_profile'] = vehicle_profile
@@ -309,12 +309,14 @@ def write_metrics(path, results):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('model', type=Path, help='Saved PPO .zip file')
-    parser.add_argument('--output', type=Path, default=Path('runs/ppo_test'),
+    parser.add_argument('--output', type=Path, default=Path('runs/ppo_dijkstra_v5'),
                         help='输出目录；保存 evaluation.png 和 evaluation_metrics.csv')
     parser.add_argument('--episode-steps', type=int, default=2500)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--obstacle-count', type=int,
-                        help='覆盖 run.json 中的静态障碍物数量')
+                        help='兼容旧配置：固定静态障碍物数量')
+    parser.add_argument('--min-obstacles', type=int, default=None)
+    parser.add_argument('--max-obstacles', type=int, default=None)
     parser.add_argument('--goal-guidance', action=argparse.BooleanOptionalAction,
                         default=None,
                         help='覆盖 run.json 中的目标引导开关')
@@ -324,7 +326,7 @@ def main():
                         help='覆盖默认 CSV 路径（默认输出目录/evaluation_metrics.csv）')
     parser.add_argument('--live', action='store_true',
                         help='评估过程中实时更新三维轨迹和俯视图')
-    parser.add_argument('--render-every', type=int, default=5,
+    parser.add_argument('--render-every', type=int, default=50,
                         help='实时可视化每隔多少个环境步刷新一次')
     parser.add_argument('--show', action='store_true',
                         help='在保存图片后显示评估地图窗口')
@@ -337,15 +339,21 @@ def main():
     if config.get('fin_mapping_version') != FIN_MAPPING_VERSION:
         print('Warning: model predates the corrected HoloOcean fin mapping; '
               'its policy actions and current evaluation dynamics differ.')
-    obstacle_count = (args.obstacle_count if args.obstacle_count is not None
-                      else config.get('obstacle_count', 2))
+    if args.obstacle_count is not None:
+        obstacle_range = (args.obstacle_count, args.obstacle_count)
+    else:
+        configured_range = config.get('obstacle_count_range', [2, 5])
+        obstacle_range = (
+            args.min_obstacles if args.min_obstacles is not None else configured_range[0],
+            args.max_obstacles if args.max_obstacles is not None else configured_range[1],
+        )
     goal_guidance = (args.goal_guidance if args.goal_guidance is not None
                      else config.get('goal_guidance', True))
-    if obstacle_count < 0:
-        parser.error('obstacle-count must be nonnegative')
+    if obstacle_range[0] < 0 or obstacle_range[1] < obstacle_range[0]:
+        parser.error('invalid obstacle range')
 
     torch.set_num_threads(2)
-    env = make_env(args.episode_steps, obstacle_count, goal_guidance, vehicle_profile)
+    env = make_env(args.episode_steps, goal_guidance, vehicle_profile, obstacle_range)
     if config.get('dijkstra_reward_version') != env.dijkstra_reward_version:
         print('Warning: saved model used a different Dijkstra reward version; '
               'reported rewards are not comparable with its training run.')

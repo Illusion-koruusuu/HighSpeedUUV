@@ -19,10 +19,11 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
     因此训练与 HoloOcean 回放共享水动力和执行器模型。
     """
 
-    def __init__(self, max_steps=2_500, obstacle_count=2,
+    def __init__(self, max_steps=2_500, obstacle_count=None,
                  goal_guidance=False,
                  dijkstra_resolution=2.0, ticks_per_sec=50,
-                 vehicle_profile=DEFAULT_PROFILE):
+                 vehicle_profile=DEFAULT_PROFILE,
+                 obstacle_count_range=(2, 5)):
         self.vehicle_profile = vehicle_profile
         self.actuator_overrides = actuator_overrides(vehicle_profile)
         self.ticks_per_sec = int(ticks_per_sec)
@@ -32,6 +33,7 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
             dt=1.0 / self.ticks_per_sec,
             max_steps=max_steps,
             obstacle_count=obstacle_count,
+            obstacle_count_range=obstacle_count_range,
             goal_guidance=goal_guidance,
             dijkstra_resolution=dijkstra_resolution,
             vertical_cost_scale=(3.0 if vehicle_profile == BOOSTED_PROFILE else 1.0),
@@ -69,6 +71,8 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
         action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         previous_observation = self._observe()
         action = self._apply_goal_guidance(action, previous_observation)
+        # PPO 仍完全决定两块舵面；这里只防止近目标时收油到无法转弯。
+        action = self._keep_turning_near_goal(action, previous_observation)
         previous_position = self.state.eta[:3].copy()
         actuator = self._torpedo.actuator_parameters
         fin_limit = np.deg2rad(actuator["deltaMax_fin_deg"])

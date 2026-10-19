@@ -13,9 +13,10 @@ class DijkstraNavigationEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, dt=0.02, max_steps=2_500, obstacle_count=2,
+    def __init__(self, dt=0.02, max_steps=2_500, obstacle_count=None,
                  goal_guidance=False,
-                 dijkstra_resolution=2.0, vertical_cost_scale=1.0):
+                 dijkstra_resolution=2.0, vertical_cost_scale=1.0,
+                 obstacle_count_range=(2, 5)):
         super().__init__()
         self.dt = float(dt)
         self.state = SimpleNamespace(
@@ -25,9 +26,18 @@ class DijkstraNavigationEnv(gym.Env):
         self._previous_action = np.zeros(3, dtype=float)
         self.ranges = RangeSensors()
         self.max_steps = int(max_steps)
-        self.obstacle_count = int(obstacle_count)
-        if self.obstacle_count < 0:
-            raise ValueError("obstacle_count must be nonnegative")
+        if obstacle_count is not None:
+            obstacle_count_range = (int(obstacle_count), int(obstacle_count))
+        if len(obstacle_count_range) != 2:
+            raise ValueError("obstacle_count_range must contain two integers")
+        self.obstacle_count_min, self.obstacle_count_max = map(
+            int, obstacle_count_range
+        )
+        if (self.obstacle_count_min < 0
+                or self.obstacle_count_max < self.obstacle_count_min):
+            raise ValueError("invalid obstacle_count_range")
+        # 每回合在范围内随机采样，障碍物之间不做排斥检查，因此允许重叠。
+        self.obstacle_count = self.obstacle_count_min
         self.goal_guidance = bool(goal_guidance)
         self.reward_mode = "dijkstra"
         # At HoloOcean's 50 Hz step, the geodesic potential changes by only a
@@ -57,7 +67,18 @@ class DijkstraNavigationEnv(gym.Env):
         self.slowdown_distance = 12.0
         # The vehicle has nonzero speed and actuator lag.  Treat the goal as a
         # capture region rather than requiring an exact point crossing.
-        self.goal_radius = 5.0
+        # 50 Hz 积分与执行器滞后会让单步轨迹跨过边界；6 m 捕获球给出
+        # 与当前高速模型相称的实际到达判据，同时 Dijkstra 目标区域同步扩大。
+        self.goal_radius = 6.0
+        # 舵面只有在有前进速度时才有足够的转向力。目标附近若完全收油，
+        # 潜航器会停在捕获球外，之后无法重新对准目标。
+        # 留出六个捕获半径的提前量，弥补潜航器转弯惯性和舵面滞后。
+        self.capture_turn_distance = 6.0 * self.goal_radius
+        self.capture_turn_angle = 0.20
+        self.capture_min_throttle = -0.90
+        self.capture_steering_gain = 1.2
+        self.capture_vertical_gain = 1.8
+        self.capture_min_rudder = 0.65
         # PPO is still responsible for obstacle avoidance.  When the sonar
         # is clear, these low-level terms keep actuator commands pointed at
         # the waypoint so a temporary avoidance turn does not become an orbit.
@@ -128,6 +149,9 @@ class DijkstraNavigationEnv(gym.Env):
         ])
 
         self.desired_surge = float(self.np_random.uniform(1.5, 2.5))
+        self.obstacle_count = int(self.np_random.integers(
+            self.obstacle_count_min, self.obstacle_count_max + 1
+        ))
         self.obstacles = []
         for _ in range(self.obstacle_count):
             distance = self.np_random.uniform(16.0, min(42.0, goal_distance - 8.0))
@@ -138,7 +162,7 @@ class DijkstraNavigationEnv(gym.Env):
                 distance * np.cos(pitch) * np.sin(yaw),
                 np.clip(10.0 - distance * np.sin(pitch), 3.0, 25.0),
             ])
-            radius = float(self.np_random.uniform(1.5, 3.0))
+            radius = float(self.np_random.uniform(1.5, 3.5))
             self.obstacles.append((center, radius))
 
     def _build_dijkstra_field(self):
@@ -285,6 +309,32 @@ class DijkstraNavigationEnv(gym.Env):
         speed_ratio = np.clip(target_speed / max(self.desired_surge, 1e-6), 0.0, 1.0)
         throttle_limit = 2.0 * speed_ratio - 1.0
         action[2] = min(action[2], throttle_limit)
+        return np.clip(action, -1.0, 1.0)
+
+    def _keep_turning_near_goal(self, action, observation):
+        """目标附近做有限残差修正，避免低速时错过目标后继续绕行。"""
+        distance = float(observation["target"][3]) * self.goal_distance_scale
+        pitch_error = abs(float(observation["target"][0]))
+        yaw_error = abs(float(observation["target"][1]))
+        if (distance <= self.capture_turn_distance
+                and observation["purpose"][0] <= 0.0
+                and max(pitch_error, yaw_error) > self.capture_turn_angle):
+            action = action.copy()
+            # 这是残差而非直接覆盖：保留一半 PPO 舵面输出，再加上有界
+            # 的目标方向修正；因此远距离规划和障碍绕行仍由策略决定。
+            gain = self.capture_steering_gain
+            action[0] = 0.5 * action[0] + gain * np.tanh(
+                float(observation["target"][1]) / 0.7
+            )
+            # 末端若 PPO 仍给出相反舵向，至少纠正舵向；不强行指定完整舵角。
+            yaw = float(observation["target"][1])
+            if abs(yaw) > self.capture_turn_angle:
+                action[0] = np.sign(yaw) * max(abs(float(action[0])),
+                                                self.capture_min_rudder)
+            action[1] = 0.5 * action[1] - self.capture_vertical_gain * np.tanh(
+                float(observation["target"][0]) / 0.7
+            )
+            action[2] = max(float(action[2]), self.capture_min_throttle)
         return np.clip(action, -1.0, 1.0)
 
     def reset(self, *, seed=None, options=None):
