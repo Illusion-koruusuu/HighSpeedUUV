@@ -12,6 +12,7 @@ from stable_baselines3 import PPO
 
 from highspeed_uuv.dijkstra import build_cost_field
 from highspeed_uuv.holoocean_env import HoloOceanTorpedoEnv
+from highspeed_uuv.policy import SonarCNNFeaturesExtractor  # 确保可反序列化 PPO CNN
 from highspeed_uuv.vehicle_profile import (DEFAULT_PROFILE, FIN_MAPPING_VERSION,
                                            STANDARD_PROFILE)
 
@@ -22,6 +23,7 @@ def make_env(episode_steps, goal_guidance, vehicle_profile=DEFAULT_PROFILE,
         max_steps=episode_steps,
         obstacle_count_range=obstacle_count_range,
         goal_guidance=goal_guidance,
+        capture_assist=False,
     )
     kwargs['vehicle_profile'] = vehicle_profile
     return HoloOceanTorpedoEnv(**kwargs)
@@ -309,7 +311,7 @@ def write_metrics(path, results):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('model', type=Path, help='Saved PPO .zip file')
-    parser.add_argument('--output', type=Path, default=Path('runs/ppo_dijkstra_v5'),
+    parser.add_argument('--output', type=Path, default=Path('runs/ppo_test'),
                         help='输出目录；保存 evaluation.png 和 evaluation_metrics.csv')
     parser.add_argument('--episode-steps', type=int, default=2500)
     parser.add_argument('--seed', type=int, default=0)
@@ -335,6 +337,8 @@ def main():
         parser.error('episode-steps, episodes, and render-every must be positive')
 
     config = load_run_config(args.model)
+    if config.get('observation_type') != 'three_sonar_maps_v1':
+        parser.error('model run.json is not a three-sonar CNN run')
     vehicle_profile = config.get('vehicle_profile') or STANDARD_PROFILE
     if config.get('fin_mapping_version') != FIN_MAPPING_VERSION:
         print('Warning: model predates the corrected HoloOcean fin mapping; '

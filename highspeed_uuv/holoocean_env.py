@@ -1,4 +1,4 @@
-"""使用 HoloOcean Torpedo Fossen 动力学的 Gymnasium 训练环境。"""
+"""基于 HoloOcean Torpedo Fossen 动力学的 Gymnasium 训练环境。"""
 import contextlib
 import io
 
@@ -20,11 +20,12 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
     """
 
     def __init__(self, max_steps=2_500, obstacle_count=None,
-                 goal_guidance=False,
+                 goal_guidance=False, capture_assist=False,
                  dijkstra_resolution=2.0, ticks_per_sec=50,
                  vehicle_profile=DEFAULT_PROFILE,
                  obstacle_count_range=(2, 5)):
         self.vehicle_profile = vehicle_profile
+        self.capture_assist = bool(capture_assist)
         self.actuator_overrides = actuator_overrides(vehicle_profile)
         self.ticks_per_sec = int(ticks_per_sec)
         if self.ticks_per_sec <= 0:
@@ -71,8 +72,9 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
         action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         previous_observation = self._observe()
         action = self._apply_goal_guidance(action, previous_observation)
-        # PPO 仍完全决定两块舵面；这里只防止近目标时收油到无法转弯。
-        action = self._keep_turning_near_goal(action, previous_observation)
+        # 新声呐策略默认直接控制三个执行器；仅对照实验才启用旧末端辅助。
+        if self.capture_assist:
+            action = self._keep_turning_near_goal(action, previous_observation)
         previous_position = self.state.eta[:3].copy()
         actuator = self._torpedo.actuator_parameters
         fin_limit = np.deg2rad(actuator["deltaMax_fin_deg"])
@@ -136,9 +138,9 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
         reward = navigation_total + 0.2 * arrival_speed_reward
         # 成功、碰撞和越界都是强终止信号，防止失败轨迹继续污染回报。
         if reached:
-            reward += 1000.0
+            reward += self.success_reward
         if collided:
-            reward -= 1000.0
+            reward -= self.collision_penalty
         if out_of_bounds:
             reward -= self.out_of_bounds_penalty
         self._previous_action = action.copy()
@@ -156,6 +158,10 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
             "reward_distance_progress": distance_progress,
             "reward_alignment_progress": alignment_progress,
             "reward_speed_shortfall": -speed_shortfall,
+            "reward_time_penalty": -self.dijkstra_time_penalty,
+            "reward_terminal_success": self.success_reward if reached else 0.0,
+            "reward_terminal_collision": -self.collision_penalty if collided else 0.0,
+            "reward_terminal_bounds": -self.out_of_bounds_penalty if out_of_bounds else 0.0,
             "dijkstra_previous": float(dijkstra_previous),
             "dijkstra_current": float(dijkstra_current),
             "dijkstra_outside": bool(current_outside),
