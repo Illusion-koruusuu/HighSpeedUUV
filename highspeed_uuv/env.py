@@ -5,7 +5,7 @@ import numpy as np
 from gymnasium import spaces
 
 from .dijkstra import build_cost_field, interpolate_cost
-from .sensors import RangeSensors
+from .sensors import SonarArray
 
 
 class DijkstraNavigationEnv(gym.Env):
@@ -24,7 +24,7 @@ class DijkstraNavigationEnv(gym.Env):
             nu=np.zeros(6, dtype=float),
         )
         self._previous_action = np.zeros(3, dtype=float)
-        self.ranges = RangeSensors()
+        self.sonar = SonarArray()
         self.max_steps = int(max_steps)
         if obstacle_count is not None:
             obstacle_count_range = (int(obstacle_count), int(obstacle_count))
@@ -45,13 +45,31 @@ class DijkstraNavigationEnv(gym.Env):
         # sees it so the navigation signal is not drowned by the terminal
         # reward and value-function noise.
         self.dijkstra_reward_scale = 10.0
-        self.dijkstra_reward_version = 5
+        self.dijkstra_reward_version = 11
         self.dijkstra_depth_weight = 15.0
         self.dijkstra_alignment_weight = 5.0
-        self.dijkstra_time_penalty = 0.02
-        self.dijkstra_speed_shortfall_weight = 0.03
-        self.dijkstra_distance_progress_weight = 2.0
-        self.out_of_bounds_penalty = 1000.0
+        # 终止项和逐步塑形奖励保持相近量级，避免 critic 只拟合成败标签。
+        self.success_reward = 150.0
+        self.collision_penalty = 300.0
+        self.out_of_bounds_penalty = 300.0
+        self.dijkstra_time_penalty = 0.05
+        self.dijkstra_speed_shortfall_weight = 0.50
+        self.dijkstra_distance_progress_weight = 8.0
+        self.dijkstra_cruise_speed_weight = 0.50
+        self.dijkstra_path_follow_weight = 4.0
+        # 目标捕获阶段：绝对方向误差、径向接近和目标方向速度。
+        self.capture_reward_distance = 20.0
+        self.capture_alignment_weight = 3.0
+        self.capture_radial_progress_weight = 15.0
+        self.capture_radial_velocity_weight = 1.5
+        # 清水巡航时不能长期把油门压到怠速，否则舵面没有转向力且距离进展为零。
+        # 归一化油门 -0.2 对应约 1200 rpm，在当前 Fossen 参数下可维持约 2 m/s。
+        self.cruise_min_throttle = -0.20
+        # 近障碍时允许明显降速，但不能降到执行器失去水动力的怠速区。
+        self.avoidance_min_throttle = -0.50
+        self.cruise_min_distance = 8.0
+        self.cruise_floor_enter_speed = 1.2
+        self.cruise_floor_release_speed = 1.5
         self.dijkstra_resolution = float(dijkstra_resolution)
         if self.dijkstra_resolution <= 0.0:
             raise ValueError("dijkstra_resolution must be positive")
@@ -94,11 +112,11 @@ class DijkstraNavigationEnv(gym.Env):
 
         # 动作仍为 [方向舵、水平舵、螺旋桨] 的归一化命令。
         self.action_space = spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
-        # 任务开关、目标相对状态、左右声呐命中束数、速度。
+        # 声呐输入保留三路二维回波图，由 CNN 学习空间障碍特征。
         self.observation_space = spaces.Dict({
-            "purpose": spaces.Box(0.0, 1.0, shape=(1,), dtype=np.float32),
+            "sonar": spaces.Box(0.0, 1.0, shape=self.sonar.observation_shape,
+                                dtype=np.float32),
             "target": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
-            "obstacle": spaces.Box(0.0, 61.0, shape=(2,), dtype=np.float32),
             "velocity": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
         })
 
@@ -209,6 +227,89 @@ class DijkstraNavigationEnv(gym.Env):
             np.linalg.norm(position - self.goal)
         ) * 0.05
 
+    def _plan_dijkstra_path(self, start, max_points=2000):
+        """从当前起点沿已有代价场提取到目标的滚动最短路径。
+
+        目标和静态障碍物不变时，重新搜索整张场没有新信息；改变起点后重新
+        提取下降路径，得到的路径前缀才是本步对应的最短路径。
+        """
+        if self._cost_field is None:
+            return np.empty((0, 3), dtype=float)
+        shape = np.asarray(self._cost_field.shape, dtype=int)
+        current = tuple(np.rint(
+            (np.asarray(start, dtype=float) - self._cost_origin)
+            / self._cost_resolution
+        ).astype(int).clip(0, shape - 1))
+        path = [self._cost_origin + np.asarray(current) * self._cost_resolution]
+        offsets = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+            if (dx, dy, dz) != (0, 0, 0)
+        ]
+        for _ in range(max_points):
+            current_cost = float(self._cost_field[current])
+            if not np.isfinite(current_cost) or current_cost <= 1e-5:
+                break
+            candidates = []
+            for dx, dy, dz in offsets:
+                neighbor = (current[0] + dx, current[1] + dy, current[2] + dz)
+                if any(index < 0 or index >= shape[axis]
+                       for axis, index in enumerate(neighbor)):
+                    continue
+                if self._cost_occupancy[neighbor]:
+                    continue
+                # 对角移动时检查所有经过的面相邻格，避免从膨胀障碍物棱角斜穿。
+                axes = [axis for axis, step in enumerate((dx, dy, dz)) if step]
+                blocked_corner = False
+                for mask in range(1, (1 << len(axes)) - 1):
+                    probe = list(current)
+                    for bit, axis in enumerate(axes):
+                        if mask & (1 << bit):
+                            probe[axis] += (dx, dy, dz)[axis]
+                    if self._cost_occupancy[tuple(probe)]:
+                        blocked_corner = True
+                        break
+                if blocked_corner:
+                    continue
+                neighbor_cost = float(self._cost_field[neighbor])
+                if np.isfinite(neighbor_cost):
+                    candidates.append((neighbor_cost, neighbor))
+            if not candidates:
+                break
+            next_cost, next_index = min(candidates, key=lambda item: item[0])
+            if next_cost >= current_cost - 1e-6:
+                break
+            current = next_index
+            path.append(self._cost_origin + np.asarray(current)
+                        * self._cost_resolution)
+        return np.asarray(path, dtype=float)
+
+    @staticmethod
+    def _path_progress_and_error(position, path):
+        """返回位置在规划路径上的弧长进展和到路径的最近距离。"""
+        if len(path) < 2:
+            return 0.0, float("inf")
+        best_error = float("inf")
+        best_progress = 0.0
+        accumulated = 0.0
+        point = np.asarray(position, dtype=float)
+        for start, end in zip(path[:-1], path[1:]):
+            segment = end - start
+            length = float(np.linalg.norm(segment))
+            if length <= 1e-9:
+                continue
+            fraction = float(np.clip(
+                np.dot(point - start, segment) / (length * length), 0.0, 1.0
+            ))
+            error = float(np.linalg.norm(point - (start + fraction * segment)))
+            if error < best_error:
+                best_error = error
+                best_progress = accumulated + fraction * length
+            accumulated += length
+        return best_progress, best_error
+
     def _outside_dijkstra_field(self, position):
         return self._outside_planning_bounds(position)
 
@@ -234,7 +335,7 @@ class DijkstraNavigationEnv(gym.Env):
         # Reward useful cruise speed only in clear water and when roughly
         # facing the goal; near an obstacle or while turning, slowing is valid.
         yaw_error = float(observation["target"][1])
-        speed_gate = (1.0 - float(observation["purpose"][0])) * max(
+        speed_gate = (0.0 if self._is_avoiding(observation) else 1.0) * max(
             0.0, np.cos(yaw_error)
         )
         speed_shortfall = speed_gate * max(
@@ -243,14 +344,53 @@ class DijkstraNavigationEnv(gym.Env):
         return (distance_progress, depth_progress, float(alignment_progress),
                 float(speed_shortfall))
 
+    def _capture_navigation_rewards(self, previous_position, position,
+                                    observation, surge):
+        """目标附近的末端捕获奖励，专门抑制等距绕圈。"""
+        distance = float(np.linalg.norm(self.goal - position))
+        gate = float(np.clip(
+            (self.capture_reward_distance - distance)
+            / self.capture_reward_distance, 0.0, 1.0,
+        ))
+        if gate <= 0.0:
+            return 0.0, 0.0, 0.0, 0.0
+
+        # alignment_progress 只看角度变化；这里增加当前绝对误差的持续惩罚。
+        pitch_error = abs(float(observation["target"][0]))
+        yaw_error = abs(float(observation["target"][1]))
+        alignment_error = float(np.clip(
+            0.5 * yaw_error / np.pi
+            + 0.5 * pitch_error / (np.pi / 2.0),
+            0.0, 1.0,
+        ))
+        alignment_reward = -alignment_error
+
+        previous_distance = float(np.linalg.norm(self.goal - previous_position))
+        radial_progress = float(np.clip(
+            previous_distance - distance, -0.1, 0.1
+        ))
+
+        # 体坐标线速度转换为 NED 速度，计算朝向目标的速度投影。
+        world_velocity = self.sonar._rotation_matrix(self.state.eta) @ self.state.nu[:3]
+        goal_delta = self.goal - position
+        goal_norm = max(float(np.linalg.norm(goal_delta)), 1e-6)
+        radial_velocity = float(np.dot(world_velocity, goal_delta / goal_norm))
+        radial_velocity_reward = float(np.clip(
+            radial_velocity / max(self._target_surge(distance), 0.5),
+            -1.0, 1.0,
+        ))
+        _ = surge  # 保留显式参数，避免误用角速度替代线速度。
+        total = gate * (
+            self.capture_alignment_weight * alignment_reward
+            + self.capture_radial_progress_weight * radial_progress
+            + self.capture_radial_velocity_weight * radial_velocity_reward
+        )
+        return (float(total), float(alignment_reward),
+                float(radial_progress), float(radial_velocity_reward))
+
     def observation_from_state(self, eta, nu):
         """由任意 NED 位姿和速度构造策略观测，供 HoloOcean 回放复用。"""
-        front_range = self.ranges._scan(eta, self.ranges.front_angles,
-                                        self.obstacles)                             # 扫描前方声呐数据
-        detected = front_range < self.ranges.max_range                              # 是否有障碍物命中
-        left_beams = np.count_nonzero(detected & (self.ranges.front_angles > 0))    # 左右声呐命中束数
-        right_beams = np.count_nonzero(detected & (self.ranges.front_angles < 0))
-        avoiding = float(left_beams + right_beams > 0)                               # 是否处于避碰状态
+        sonar = self.sonar.observe(eta, self.obstacles)
 
         delta = self.goal - eta[:3]
         target_distance = float(np.linalg.norm(delta))
@@ -262,8 +402,7 @@ class DijkstraNavigationEnv(gym.Env):
                                       0.0, 1.0)
         # 推进器不能反转制动，因此在终点前预留减速距离，避免高速擦过目标。
         target_surge = self._target_surge(target_distance)
-        # 保留目标信息；purpose 单独表明正在避碰，避免策略转向后丢失
-        # 重新对准目标的依据。这是相对论文“完全屏蔽目标”的工程调整。
+        # 保留目标信息，使策略绕开障碍后还能重新对准目标。
         target = np.array([
             target_pitch,
             target_yaw,
@@ -271,11 +410,31 @@ class DijkstraNavigationEnv(gym.Env):
             normalized_distance,
         ])
         return {
-            "purpose": np.array([avoiding], dtype=np.float32),
+            "sonar": sonar,
             "target": target.astype(np.float32),
-            "obstacle": np.array([right_beams, left_beams], dtype=np.float32),
             "velocity": nu[[0, 1, 2, 4, 5]].astype(np.float32),
         }
+
+    def _is_avoiding(self, observation):
+        """用近距离前向/舷侧回波判断是否确实需要即时避障。"""
+        return self.sonar.near_obstacle(observation["sonar"])
+
+    def _apply_cruise_floor(self, action, observation):
+        """只在艇速塌到近乎停航时恢复最低机动速度，随后交还 PPO。"""
+        distance = float(observation["target"][3]) * self.goal_distance_scale
+        surge = float(observation["velocity"][0])
+        if (distance <= self.cruise_min_distance
+                or surge >= self.cruise_floor_release_speed):
+            return action
+        if surge >= self.cruise_floor_enter_speed:
+            # 滞回带内先不切换动作，避免在阈值附近反复开关推进下限。
+            return action
+        action = action.copy()
+        minimum = (self.avoidance_min_throttle
+                   if self._is_avoiding(observation)
+                   else self.cruise_min_throttle)
+        action[2] = max(float(action[2]), minimum)
+        return np.clip(action, -1.0, 1.0)
 
     def _observe(self):
         return self.observation_from_state(self.state.eta, self.state.nu)
@@ -286,7 +445,7 @@ class DijkstraNavigationEnv(gym.Env):
             return action
         if observation is None:
             observation = self._observe()
-        if observation["purpose"][0] > 0.0:
+        if self._is_avoiding(observation):
             return action
         scale = self.goal_guidance_gain
         angle = self.goal_guidance_angle
@@ -317,7 +476,7 @@ class DijkstraNavigationEnv(gym.Env):
         pitch_error = abs(float(observation["target"][0]))
         yaw_error = abs(float(observation["target"][1]))
         if (distance <= self.capture_turn_distance
-                and observation["purpose"][0] <= 0.0
+                and not self._is_avoiding(observation)
                 and max(pitch_error, yaw_error) > self.capture_turn_angle):
             action = action.copy()
             # 这是残差而非直接覆盖：保留一半 PPO 舵面输出，再加上有界
@@ -344,6 +503,7 @@ class DijkstraNavigationEnv(gym.Env):
         self._sample_scene()
         self._build_dijkstra_field()
         self.steps = 0
+        self._previous_action.fill(0.0)
         return self._observe(), {}
 
     def step(self, action):

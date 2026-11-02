@@ -71,7 +71,11 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
         # PPO 输出的是归一化舵角和油门；这里映射到 Torpedo 的物理执行器输入。
         action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         previous_observation = self._observe()
+        # 障碍物和目标在回合内静态，复用这张全局代价场；每步从当前位置
+        # 重新提取路径前缀，等价于以当前位置作为新的 Dijkstra 起点滚动规划。
+        planned_path = self._plan_dijkstra_path(self.state.eta[:3])
         action = self._apply_goal_guidance(action, previous_observation)
+        action = self._apply_cruise_floor(action, previous_observation)
         # 新声呐策略默认直接控制三个执行器；仅对照实验才启用旧末端辅助。
         if self.capture_assist:
             action = self._keep_turning_near_goal(action, previous_observation)
@@ -129,13 +133,40 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
                                              previous_observation, observation,
                                              state.nu[0])
         )
+        previous_path_progress, _ = self._path_progress_and_error(
+            previous_position, planned_path
+        )
+        current_path_progress, path_error = self._path_progress_and_error(
+            position, planned_path
+        )
+        path_progress = float(np.clip(
+            current_path_progress - previous_path_progress, -0.1, 0.1
+        ))
+        path_follow_reward = path_progress - 0.02 * float(
+            np.clip(path_error, 0.0, 10.0)
+        )
+        speed_gate = (0.0 if self._is_avoiding(observation) else 1.0) * max(
+            0.0, np.cos(float(observation["target"][1]))
+        )
+        speed_reference = max(target_surge, 0.1)
+        cruise_speed_reward = speed_gate * np.clip(
+            state.nu[0] / speed_reference, 0.0, 1.0
+        )
+        (capture_reward, capture_alignment_reward, capture_radial_progress,
+         capture_radial_velocity) = self._capture_navigation_rewards(
+            previous_position, position, observation, state.nu[0]
+        )
         navigation_total = (self.dijkstra_reward_scale * navigation_reward
                             + self.dijkstra_distance_progress_weight * distance_progress
                             + self.dijkstra_depth_weight * depth_progress
                             + self.dijkstra_alignment_weight * alignment_progress
                             - self.dijkstra_time_penalty
                             - self.dijkstra_speed_shortfall_weight * speed_shortfall)
-        reward = navigation_total + 0.2 * arrival_speed_reward
+        reward = (navigation_total
+                  + self.dijkstra_cruise_speed_weight * cruise_speed_reward
+                  + self.dijkstra_path_follow_weight * path_follow_reward
+                  + capture_reward
+                  + 0.2 * arrival_speed_reward)
         # 成功、碰撞和越界都是强终止信号，防止失败轨迹继续污染回报。
         if reached:
             reward += self.success_reward
@@ -158,6 +189,15 @@ class HoloOceanTorpedoEnv(DijkstraNavigationEnv):
             "reward_distance_progress": distance_progress,
             "reward_alignment_progress": alignment_progress,
             "reward_speed_shortfall": -speed_shortfall,
+            "reward_cruise_speed": cruise_speed_reward,
+            "reward_capture": capture_reward,
+            "reward_capture_alignment": capture_alignment_reward,
+            "reward_capture_radial_progress": capture_radial_progress,
+            "reward_capture_radial_velocity": capture_radial_velocity,
+            "reward_path_progress": path_progress,
+            "reward_path_follow": path_follow_reward,
+            "dijkstra_path_error": path_error,
+            "cruise_throttle_floor": self.cruise_min_throttle,
             "reward_time_penalty": -self.dijkstra_time_penalty,
             "reward_terminal_success": self.success_reward if reached else 0.0,
             "reward_terminal_collision": -self.collision_penalty if collided else 0.0,

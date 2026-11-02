@@ -109,3 +109,26 @@ class SonarArray:
     def hit_count(self, sonar):
         """根据三个回波通道判断是否正在避障。"""
         return int(np.count_nonzero(sonar[[1, 3, 5]]))
+
+    def near_obstacle(self, sonar, front_limit=18.0, side_limit=10.0):
+        """只把近距离威胁标为避障，远处回波不应长期关闭巡航推进。
+
+        前向只看中心 ±30°；侧向看左右声呐各自中心 ±35°。视场边缘、远距离
+        障碍仍提供给 CNN，但不再被误判成当前必须减速/转向的威胁。
+        """
+        hit_channels = (1, 3, 5)
+        distance_channels = (0, 2, 4)
+        max_angle = 30.0
+        angles = np.linspace(-60.0, 60.0, self.azimuth_bins)
+        front_mask = np.abs(angles) <= max_angle
+        side_mask = np.abs(angles) <= 35.0
+
+        def close_return(view_index, angle_mask, limit):
+            hit = sonar[hit_channels[view_index]][:, angle_mask] > 0.5
+            normalized = sonar[distance_channels[view_index]][:, angle_mask]
+            distance = self.range_min + normalized * (self.range_max - self.range_min)
+            return bool(np.any(hit & (distance <= limit)))
+
+        return (close_return(0, front_mask, front_limit)
+                or close_return(1, side_mask, side_limit)
+                or close_return(2, side_mask, side_limit))

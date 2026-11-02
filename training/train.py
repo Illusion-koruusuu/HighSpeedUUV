@@ -66,11 +66,11 @@ def main():
     parser.add_argument("--n-steps", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", type=Path, default=Path("runs/ppo_sonar_dijkstra_v2"))
+    parser.add_argument("--output", type=Path, default=Path("runs/ppo_sonar_dijkstra_v5"))
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--vehicle-profile", choices=("standard", "boosted"), default=DEFAULT_PROFILE)
     parser.add_argument("--min-obstacles", type=int, default=2)
-    parser.add_argument("--max-obstacles", type=int, default=10)
+    parser.add_argument("--max-obstacles", type=int, default=5)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.timesteps <= 0 or args.episode_steps <= 0 or args.n_steps <= 1:
@@ -91,7 +91,7 @@ def main():
             parser.error("resume needs an existing model and its run.json")
         config = json.loads(config_path.read_text(encoding="utf-8"))
         if (config.get("reward_mode") != "dijkstra"
-                or config.get("dijkstra_reward_version") != 6
+                or config.get("dijkstra_reward_version") != 11
                 or config.get("observation_type") != "three_sonar_maps_v1"):
             parser.error("resume model is not compatible with the three-sonar policy")
         if config.get("vehicle_profile") != args.vehicle_profile:
@@ -190,6 +190,19 @@ def main():
             "terminal_success_reward": base_env.success_reward,
             "terminal_collision_penalty": base_env.collision_penalty,
             "terminal_out_of_bounds_penalty": base_env.out_of_bounds_penalty,
+            "cruise_speed_reward_weight": base_env.dijkstra_cruise_speed_weight,
+            "path_follow_reward_weight": base_env.dijkstra_path_follow_weight,
+            "capture_reward_distance_m": base_env.capture_reward_distance,
+            "capture_alignment_weight": base_env.capture_alignment_weight,
+            "capture_radial_progress_weight": base_env.capture_radial_progress_weight,
+            "capture_radial_velocity_weight": base_env.capture_radial_velocity_weight,
+            "cruise_min_throttle": base_env.cruise_min_throttle,
+            "avoidance_min_throttle": base_env.avoidance_min_throttle,
+            "cruise_min_distance_m": base_env.cruise_min_distance,
+            "cruise_floor_enter_speed_mps": base_env.cruise_floor_enter_speed,
+            "cruise_floor_release_speed_mps": base_env.cruise_floor_release_speed,
+            "sonar_threat_front_m": 18.0,
+            "sonar_threat_side_m": 10.0,
             "obstacle_curriculum": [[0, min(2, args.max_obstacles)],
                                      [args.min_obstacles, min(5, args.max_obstacles)],
                                      list(obstacle_range)],

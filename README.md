@@ -1,31 +1,145 @@
 # HighSpeedUUV
 
-这是当前版本的 HoloOcean-only 三维 UUV 导航项目。训练和验证统一使用
-HoloOcean 的 `Torpedo` Fossen 动力学，任务奖励使用 Dijkstra-v5 代价场。
-旧的 Python REMUS100 模型、欧式距离基线和历史训练脚本不属于本项目。
+这是 HoloOcean Fossen Torpedo 动力学上的三维 UUV 导航项目，任务奖励使用
+Dijkstra-v5 代价场。训练不启动 Unreal/HoloOcean 世界；声呐使用 HoloOcean 配置的
+三路视场与量程，通过球形障碍物几何射线生成，不包含回波强度渲染。
 
 ## 目录
 
-- `highspeed_uuv/`: 环境、HoloOcean 动力学适配、Dijkstra、传感器和执行器配置。
-- `training/train.py`: Dijkstra-v5 PPO 训练，支持 `--resume`。
+- `highspeed_uuv/`: 环境、HoloOcean 动力学适配、Dijkstra、三路声呐和 CNN 编码器。
+- `training/train.py`: 三路声呐 CNN + 普通 PPO 训练，支持 `--resume`。
 - `training/evaluate.py`: 评估模型并把 CSV、PNG 输出到一个目录。
-- `runs/ppo_dijkstra_v5/`: 当前保留的 v5 模型、配置和评估产物。
+- `runs/ppo_sonar_dijkstra_v1/`: 新模型的默认输出目录。
 
 ## 运行
 
-请先在安装了 HoloOcean、Stable-Baselines3 和 PyTorch 的环境中安装本项目：
+请先在安装了 HoloOcean Fossen、Stable-Baselines3 和 PyTorch 的环境中安装本项目：
 
 ```bash
 pip install -e '.[train]'
-python -m training.train --timesteps 1000000 --output runs/ppo_dijkstra_v5
-python -m training.evaluate runs/ppo_dijkstra_v5/ppo_dijkstra.zip --output runs/ppo_test
+python -m training.train --timesteps 1000000 --output runs/ppo_sonar_dijkstra_v5
+python -m training.evaluate runs/ppo_sonar_dijkstra_v5/ppo_sonar.zip --output runs/ppo_sonar_test
 ```
 
-默认每回合随机生成 2～5 个障碍物；可用 `--min-obstacles` 和
+训练默认每回合随机生成 2～5 个障碍物；可用 `--min-obstacles` 和
 `--max-obstacles` 修改训练范围，评估时使用同名参数。障碍物中心和半径独立随机，
 不同障碍物之间允许重叠。
 
 `z` 是 NED 深度坐标，正方向向下。Dijkstra 规划区域固定为
 `x[-20,100]、y[-70,70]、z[0,40]`，越界立即结束回合并处罚。当前目标捕获球半径为
-6 m；目标附近的残差只在无障碍时提前保持转弯所需的推进，并按目标方位修正舵向，
-远距离路径规划和避障仍由 PPO 控制。
+6 m。远处回波仍输入 CNN，但只有前向 18 m、舷侧 10 m 内的回波才触发即时避障
+状态；清水远距离时最低油门对应约 2 m/s，近障碍时允许降到约 1.6 m/s，避免艇
+为了避障把推进完全关掉而失去舵面机动能力。
+
+## 声呐输入
+
+每路图包含归一化距离与回波掩码两个通道，三路合并为 `(6, 24, 64)`：
+
+- 前视 `ImagingSonar` 几何视场：水平 120°、垂直 30°。
+- 左右 `SidescanSonar` 几何视场：NED 艇体系中分别朝向 -90°/+90°，
+  水平 120°、垂直 5°。
+- 三路量程均为 0.5～40 m；CNN 将声呐图特征与目标/速度状态融合。
+
+这些是训练端几何传感器的配置，不是 Unreal 中实际渲染的声呐图像。尤其是
+HoloOcean 原生 `SidescanSonar` 输出一维回波强度，本项目将侧向视场采样成二维
+角度-距离图以便 CNN 使用；将来接入真实 HoloOcean 回波时需要做输入适配和验证。
+声呐噪声和失真、LSTM 均未启用。训练以 0～2 个障碍物开始，逐渐增加到目标
+障碍物范围。清水远距离巡航时保留最低油门，避免策略学成原地停滞；奖励使用 VecNormalize 归一化，价值/回报诊断写入输出目录下的
+`logs/progress.csv`。由于奖励版本已更新，旧模型不能用于 resume；请从头训练。
+
+目标 20 m 内额外使用绝对方向误差、径向距离进展和目标方向速度奖励，避免只靠
+角度变化奖励导致潜航器在目标附近等距转圈。
+
+=================================================================================
+
+# 最大速度测试
+按当前 HoloOcean Torpedo Fossen 模型测试，满油门、无障碍、水平舵和方向舵为零时：
+
+| 配置 | `nMax` | 稳态速度 | 约合节速 |
+|---|---:|---:|---:|
+| `standard` | 1525 RPM | 2.55 m/s | 4.96 节 |
+| 当前 `boosted` | 3000 RPM | 5.02 m/s | 9.76 节 |
+
+因此，当前项目配置下实际最快约为：
+
+```text
+5.0 m/s ≈ 9.8 节 ≈ 18.1 km/h
+```
+
+这个速度是推进力和水动力阻力平衡后的稳态速度，不是简单的速度上限。测试过程中环境可能因为固定规划边界 `x=100 m` 提前终止，但终止前速度已经稳定在约 `5.02 m/s`。
+
+参数位于：
+
+[vehicle_profile.py](/home/lu/code/HighSpeedUUV/highspeed_uuv/vehicle_profile.py)
+
+当前 `boosted` 主要只修改了：
+
+```python
+{"nMax": 3000}
+```
+
+我进一步做了参数外推测试：
+
+| `nMax` | 稳态速度 |
+|---:|---:|
+| 3000 RPM | 5.02 m/s |
+| 4000 RPM | 6.70 m/s |
+| 5000 RPM | 8.37 m/s |
+| 6000 RPM | 10.05 m/s |
+
+在当前模型中，速度大致随转速上限近似线性增加。
+
+如果目标是 **70 节**：
+
+```text
+70 节 ≈ 36.0 m/s
+```
+
+按照当前模型粗略外推，需要大约：
+
+```text
+nMax ≈ 21000～22000 RPM
+```
+
+这已经不是普通 REMUS100 参数的合理范围，而是模型公式的极端外推。
+
+要提高速度，有三种层次：
+
+1. **简单提高 `nMax`**
+
+   例如把：
+
+   ```python
+   {"nMax": 3000}
+   ```
+
+   改为 4000、5000 或 6000 RPM。
+
+   优点是改动简单，速度会提高。缺点是物理可信度很差，推进器扭矩、空化、结构强度和水动力参数都没有同步校准。
+
+2. **同步修改推进器和执行器模型**
+
+   需要同时重新标定：
+
+   - 螺旋桨推力系数；
+   - 螺旋桨扭矩系数；
+   - 推进器效率；
+   - 舵面最大角度和响应速度；
+   - 车体阻力系数；
+   - 质量、惯量和附加质量；
+   - 高速下的阻尼模型。
+
+   这才是合理的高速潜航器模型修改方式。
+
+3. **建立独立的高速 UUV Fossen 模型**
+
+   如果目标确实是 70 节，应建立新的高速艇体参数，而不是继续把 REMUS100 的 `nMax` 拉到两万 RPM。需要重新定义：
+
+   - 高速艇体尺寸和质量；
+   - 推进器功率；
+   - 高速阻力；
+   - 舵面和控制面尺寸；
+   - 高速姿态稳定性；
+   - 对应的控制周期和训练场景。
+
+结论是：当前模型可信的最高速度大约是 **5 m/s，也就是 10 节左右**。继续提高到 6～10 m/s 可以作为仿真外推实验，但要达到 70 节，必须更换或重建高速动力学模型，单独提高 `nMax` 会得到数值上更快、物理上不可信的结果。

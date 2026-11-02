@@ -30,6 +30,22 @@ class DijkstraFieldTests(unittest.TestCase):
         self.assertTrue(occupancy[tuple(blocked)])
         self.assertTrue(np.isfinite(interpolate_cost(field, origin, resolution, [0, 0, 10])))
 
+    def test_rolling_path_starts_at_current_state_and_reaches_goal_region(self):
+        from highspeed_uuv.env import DijkstraNavigationEnv
+
+        env = DijkstraNavigationEnv(obstacle_count=0)
+        env.reset(seed=4)
+        env.goal = np.array([30.0, 8.0, 12.0])
+        env._build_dijkstra_field()
+        start = np.array([8.0, -6.0, 16.0])
+        path = env._plan_dijkstra_path(start)
+        np.testing.assert_allclose(path[0], env._cost_origin + np.rint(
+            (start - env._cost_origin) / env._cost_resolution
+        ) * env._cost_resolution)
+        self.assertGreater(len(path), 1)
+        self.assertLessEqual(np.linalg.norm(path[-1] - env.goal), env.goal_radius + 2.0)
+        env.close()
+
 
 if __name__ == "__main__":
     unittest.main()
