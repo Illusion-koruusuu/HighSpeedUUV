@@ -1,7 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
-.runs/
+runs/
 
 *.png
 *.csv

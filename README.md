@@ -44,11 +44,118 @@ python -m training.evaluate runs/ppo_sonar_dijkstra_v5/ppo_sonar.zip --output ru
 HoloOcean 原生 `SidescanSonar` 输出一维回波强度，本项目将侧向视场采样成二维
 角度-距离图以便 CNN 使用；将来接入真实 HoloOcean 回波时需要做输入适配和验证。
 声呐噪声和失真、LSTM 均未启用。训练以 0～2 个障碍物开始，逐渐增加到目标
-障碍物范围。清水远距离巡航时保留最低油门，避免策略学成原地停滞；奖励使用 VecNormalize 归一化，价值/回报诊断写入输出目录下的
+障碍物范围。奖励使用 VecNormalize 归一化，价值/回报诊断写入输出目录下的
 `logs/progress.csv`。由于奖励版本已更新，旧模型不能用于 resume；请从头训练。
 
 目标 20 m 内额外使用绝对方向误差、径向距离进展和目标方向速度奖励，避免只靠
 角度变化奖励导致潜航器在目标附近等距转圈。
+
+## v6 兼容评估参数
+
+`runs/ppo_sonar_dijkstra_v6/run.json` 中的 `evaluation_assist` 记录了一组经过
+50 回合验证的低层辅助参数：开启目标方向引导与末端捕获辅助，捕获转向距离设为
+30 m、捕获油门下限设为 0.2、舵向下限设为 0.5。`training.evaluate` 会自动读取
+这些参数；评估命令仍为：
+
+```bash
+/home/lu/code/REMUS100_HoloOcean/.venv/bin/python -m training.evaluate \
+  runs/ppo_sonar_dijkstra_v6/ppo_sonar.zip --episodes 50
+```
+
+对应 `runs/ppo_test/evaluation_metrics.csv` 的 50 回合结果为成功率 90%、碰撞率
+0%、越界率 6%、超时率 4%。这是同一 v6 权重配合低层辅助参数的结果，不代表去掉
+辅助后的纯 PPO 成功率。
+
+## 纯 PPO 重新训练
+
+`training/train.py` 的默认配置现在是纯 PPO：`goal_guidance=False`、
+`capture_assist=False`、`cruise_assist=False`。策略只根据三路声呐、目标状态和
+速度输出舵角/油门，不再依赖运行期规则导向。为改善训练稳定性，入口同时加入了：
+
+- 有界 `tanh` 高斯动作分布，避免环境裁剪导致动作概率与执行动作不一致；
+- `ent_coef=0.001`、`log_std_init=-1.0`，降低长期随机探索；
+- 18–30 m 无障碍起步，逐步扩展到 50–70 m、2–5 个障碍物的四阶段课程；
+- 每 25k 步用 10 个固定种子做确定性评估，并保留成功率最高的 checkpoint；
+- 初始动作均值偏向 0.6 油门，但该偏置仍可被 PPO 完全学习修改。
+
+建议先运行 100 万步：
+
+```bash
+cd /home/lu/code/HighSpeedUUV
+/home/lu/code/REMUS100_HoloOcean/.venv/bin/python -m training.train \
+  --timesteps 1000000 --output runs/ppo_sonar_pure_v7 --overwrite
+```
+
+训练结束后 `ppo_sonar.zip` 会自动替换为周期性评估中成功率最高的模型，最终模型
+保存在 `ppo_sonar_final.zip`，评估记录在 `best_eval.json`。纯 PPO 评估命令：
+
+```bash
+/home/lu/code/REMUS100_HoloOcean/.venv/bin/python -m training.evaluate \
+  runs/ppo_sonar_pure_v7/ppo_sonar.zip --episodes 50
+```
+
+### v8：路径观测与防遗忘训练
+
+v7 纯 PPO 的 50 回合成功率约为 14%，80% 为超时，失败回合最小距离中位数约
+18.7 m，说明主要问题是全局导航没有稳定学会。v8 训练入口默认加入：
+
+- 策略观测新增 4 维局部 Dijkstra 路径信息：路径俯仰、路径偏航、8 m 前视距离、
+  剩余路径代价；PPO 仍直接输出舵角和油门，没有运行期动作控制器；
+- 每回合以 25% 概率抽取 25–40 m、无障碍的短距离复习场景，防止后期课程覆盖基础
+  导航能力；
+- 策略 MLP 从 `[128, 128]` 增大到 `[256, 256]`。
+
+v8 观测空间与 v7 不兼容，必须从头训练：
+
+```bash
+cd /home/lu/code/HighSpeedUUV
+/home/lu/code/REMUS100_HoloOcean/.venv/bin/python -m training.train \
+  --timesteps 1500000 --output runs/ppo_sonar_pure_v8 --overwrite
+```
+
+### v9：教师 BC 预热 + 纯 PPO 微调
+
+v8 的 500k 步实验暴露了纯 PPO 从零探索的瓶颈：路径偏航约 `0.79 rad` 时，
+策略方向舵长期只有 `±0.03`，无法学会持续转弯，最终高速越界。使用同一 `path`
+观测的简单路径跟随教师则可达到约 85%，说明问题在策略优化而不是环境。
+
+因此 v9 默认先执行 5,000 步行为克隆，仅用于初始化神经网络：
+
+- 教师根据局部路径偏航/俯仰和目标速度误差生成舵角、油门；
+- BC 损失优先拟合方向舵，100 个 epoch 后动作 MSE 可降到约 `2×10⁻⁴`；
+- BC 模型会先单独做确定性评估并作为初始最佳 checkpoint；
+- 随后以较低学习率 `1e-4` 做纯 PPO 微调；执行阶段完全没有教师或规则控制器；
+- 周期性评估仍保留成功率最高的模型，因此 PPO 微调退化时不会丢掉更好的 BC 初始化模型。
+
+已验证的 BC 初始化模型在完整难度 50 回合中成功率为 **96%**（48/50），
+模型保存在 `runs/ppo_sonar_bc_init_v9/ppo_sonar.zip`。正式训练命令：
+
+```bash
+/home/lu/code/REMUS100_HoloOcean/.venv/bin/python -m training.train \
+  --timesteps 500000 --output runs/ppo_sonar_pure_v9 --overwrite
+```
+
+## HoloOcean 可视化回放
+
+`scripts/visualize.sh` 会启动 HoloOcean 窗口，加载与评估相同的随机场景，并用
+策略实时控制 `TorpedoAUV`。金色球体是训练场景中的障碍物，白色球体是 6 m 目标
+捕获区域。
+
+```bash
+cd /home/lu/code/HighSpeedUUV
+./scripts/visualize.sh runs/ppo_sonar_pure_v7/ppo_sonar.zip \
+  --seed 0 --seconds 60
+```
+
+如果需要同时显示 HoloOcean 原生前视/侧扫声呐，可加 `--render-sonar`：
+
+```bash
+./scripts/visualize.sh runs/ppo_sonar_pure_v7/ppo_sonar.zip \
+  --seed 0 --seconds 60 --render-sonar
+```
+
+策略在训练和回放中仍使用几何三路声呐，HoloOcean 原生声呐图像目前只用于视觉
+检查，不作为策略输入。
 
 =================================================================================
 

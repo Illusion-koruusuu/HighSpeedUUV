@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from gymnasium import spaces
 
-from highspeed_uuv.policy import SonarCNNFeaturesExtractor
+from highspeed_uuv.policy import BoundedActorCriticPolicy, SonarCNNFeaturesExtractor
 from highspeed_uuv.sensors import SonarArray
 
 
@@ -59,26 +59,82 @@ class SonarObservationTests(unittest.TestCase):
         observation_space = spaces.Dict({
             "sonar": spaces.Box(0.0, 1.0, shape=(6, 24, 64), dtype=np.float32),
             "target": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
+            "path": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
             "velocity": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
         })
         extractor = SonarCNNFeaturesExtractor(observation_space, features_dim=256)
         output = extractor({
             "sonar": torch.zeros(2, 6, 24, 64),
             "target": torch.zeros(2, 4),
+            "path": torch.zeros(2, 4),
             "velocity": torch.zeros(2, 5),
         })
         self.assertEqual(tuple(output.shape), (2, 256))
+
+    def test_environment_can_include_dijkstra_path_observation(self):
+        from highspeed_uuv.holoocean_env import HoloOceanTorpedoEnv
+
+        env = HoloOceanTorpedoEnv(
+            max_steps=4, obstacle_count=0, include_path_observation=True,
+            easy_rehearsal_probability=1.0,
+        )
+        try:
+            observation, _ = env.reset(seed=0)
+            self.assertIn("path", observation)
+            self.assertEqual(observation["path"].shape, (4,))
+            self.assertTrue(np.isfinite(observation["path"]).all())
+            self.assertEqual(len(env.obstacles), 0)
+            self.assertLessEqual(np.linalg.norm(env.goal - env.state.eta[:3]), 40.0)
+        finally:
+            env.close()
+
+    def test_bounded_policy_uses_squashed_gaussian(self):
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution
+        from highspeed_uuv.holoocean_env import HoloOceanTorpedoEnv
+
+        env = HoloOceanTorpedoEnv(
+            max_steps=4, obstacle_count=0, goal_guidance=False,
+            capture_assist=False, cruise_assist=False,
+        )
+        try:
+            model = PPO(
+                BoundedActorCriticPolicy, env, n_steps=8, batch_size=8,
+                policy_kwargs={"features_extractor_class": SonarCNNFeaturesExtractor},
+            )
+            self.assertIsInstance(
+                model.policy.action_dist, SquashedDiagGaussianDistribution
+            )
+            observation, _ = env.reset(seed=0)
+            action, _ = model.predict(observation, deterministic=False)
+            self.assertTrue(np.all(action >= -1.0))
+            self.assertTrue(np.all(action <= 1.0))
+        finally:
+            env.close()
+
+    def test_curriculum_has_four_progressive_stages(self):
+        from training.train import GoalObstacleCurriculumCallback
+
+        callback = GoalObstacleCurriculumCallback(
+            2, 5, (50.0, 70.0), np.deg2rad(45.0), np.deg2rad(15.0),
+            1_000_000,
+        )
+        self.assertEqual(callback._stage(0.05)[4], 1)
+        self.assertEqual(callback._stage(0.20)[4], 2)
+        self.assertEqual(callback._stage(0.45)[4], 3)
+        self.assertEqual(callback._stage(0.80)[4], 4)
 
     def test_new_reward_version_reduces_terminal_scale(self):
         from highspeed_uuv.env import DijkstraNavigationEnv
 
         env = DijkstraNavigationEnv(obstacle_count=0)
-        self.assertEqual(env.dijkstra_reward_version, 11)
+        self.assertEqual(env.dijkstra_reward_version, 12)
         self.assertEqual(env.success_reward, 150.0)
         self.assertEqual(env.collision_penalty, 300.0)
         self.assertEqual(env.out_of_bounds_penalty, 300.0)
         self.assertGreater(env.dijkstra_distance_progress_weight, 2.0)
         self.assertGreater(env.dijkstra_speed_shortfall_weight, 0.1)
+        self.assertGreater(env.dijkstra_alignment_error_weight, 0.0)
         env.close()
 
     def test_capture_reward_prefers_radial_approach_over_tangential_motion(self):

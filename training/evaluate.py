@@ -17,16 +17,39 @@ from highspeed_uuv.vehicle_profile import (DEFAULT_PROFILE, FIN_MAPPING_VERSION,
                                            STANDARD_PROFILE)
 
 
+ASSIST_ATTRIBUTES = {
+    'capture_turn_distance_m': 'capture_turn_distance',
+    'capture_turn_angle_rad': 'capture_turn_angle',
+    'capture_min_throttle': 'capture_min_throttle',
+    'capture_steering_gain': 'capture_steering_gain',
+    'capture_vertical_gain': 'capture_vertical_gain',
+    'capture_min_rudder': 'capture_min_rudder',
+}
+
+
 def make_env(episode_steps, goal_guidance, vehicle_profile=DEFAULT_PROFILE,
-             obstacle_count_range=(2, 5)):
+             obstacle_count_range=(2, 5), capture_assist=False,
+             cruise_assist=True,
+             include_path_observation=False,
+             assist_overrides=None):
     kwargs = dict(
         max_steps=episode_steps,
         obstacle_count_range=obstacle_count_range,
         goal_guidance=goal_guidance,
-        capture_assist=False,
+        capture_assist=capture_assist,
+        cruise_assist=cruise_assist,
+        include_path_observation=include_path_observation,
     )
     kwargs['vehicle_profile'] = vehicle_profile
-    return HoloOceanTorpedoEnv(**kwargs)
+    env = HoloOceanTorpedoEnv(**kwargs)
+    for key, value in (assist_overrides or {}).items():
+        if key in ('goal_guidance', 'capture_assist'):
+            continue
+        attribute = ASSIST_ATTRIBUTES.get(key)
+        if attribute is None:
+            raise ValueError(f'unknown evaluation assist parameter: {key}')
+        setattr(env, attribute, value)
+    return env
 
 
 def load_run_config(model_path):
@@ -314,7 +337,7 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('runs/ppo_test'),
                         help='输出目录；保存 evaluation.png 和 evaluation_metrics.csv')
     parser.add_argument('--episode-steps', type=int, default=2500)
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=4)
     parser.add_argument('--obstacle-count', type=int,
                         help='兼容旧配置：固定静态障碍物数量')
     parser.add_argument('--min-obstacles', type=int, default=None)
@@ -322,6 +345,12 @@ def main():
     parser.add_argument('--goal-guidance', action=argparse.BooleanOptionalAction,
                         default=None,
                         help='覆盖 run.json 中的目标引导开关')
+    parser.add_argument('--capture-assist', action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help='覆盖 run.json 中的末端捕获辅助开关')
+    parser.add_argument('--cruise-assist', action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help='覆盖 run.json 中的低速推进下限辅助开关')
     parser.add_argument('--episodes', type=int, default=1,
                         help='测试回合数；依次使用 seed 到 seed + episodes - 1')
     parser.add_argument('--csv', type=Path,
@@ -337,8 +366,12 @@ def main():
         parser.error('episode-steps, episodes, and render-every must be positive')
 
     config = load_run_config(args.model)
-    if config.get('observation_type') != 'three_sonar_maps_v1':
-        parser.error('model run.json is not a three-sonar CNN run')
+    observation_type = config.get('observation_type')
+    if observation_type not in ('three_sonar_maps_v1', 'three_sonar_path_v2'):
+        parser.error('model run.json is not a supported three-sonar CNN run')
+    include_path_observation = config.get(
+        'include_path_observation', observation_type == 'three_sonar_path_v2'
+    )
     vehicle_profile = config.get('vehicle_profile') or STANDARD_PROFILE
     if config.get('fin_mapping_version') != FIN_MAPPING_VERSION:
         print('Warning: model predates the corrected HoloOcean fin mapping; '
@@ -351,13 +384,28 @@ def main():
             args.min_obstacles if args.min_obstacles is not None else configured_range[0],
             args.max_obstacles if args.max_obstacles is not None else configured_range[1],
         )
+    assist_config = config.get('evaluation_assist', {})
     goal_guidance = (args.goal_guidance if args.goal_guidance is not None
-                     else config.get('goal_guidance', True))
+                     else assist_config.get(
+                         'goal_guidance', config.get('goal_guidance', True)))
+    capture_assist = (args.capture_assist if args.capture_assist is not None
+                      else assist_config.get(
+                          'capture_assist', config.get('capture_assist', False)))
+    cruise_assist = (args.cruise_assist if args.cruise_assist is not None
+                     else assist_config.get(
+                         'cruise_assist', config.get('cruise_assist', True)))
     if obstacle_range[0] < 0 or obstacle_range[1] < obstacle_range[0]:
         parser.error('invalid obstacle range')
 
     torch.set_num_threads(2)
-    env = make_env(args.episode_steps, goal_guidance, vehicle_profile, obstacle_range)
+    env = make_env(args.episode_steps, goal_guidance, vehicle_profile,
+                   obstacle_range, capture_assist, cruise_assist,
+                   include_path_observation, assist_config)
+    if capture_assist or goal_guidance:
+        print(f'Evaluation assistance: goal_guidance={goal_guidance}; '
+              f'capture_assist={capture_assist}; '
+              f'capture_min_throttle={env.capture_min_throttle}; '
+              f'capture_turn_distance={env.capture_turn_distance:.1f} m')
     if config.get('dijkstra_reward_version') != env.dijkstra_reward_version:
         print('Warning: saved model used a different Dijkstra reward version; '
               'reported rewards are not comparable with its training run.')

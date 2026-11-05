@@ -1,6 +1,9 @@
-"""将完整声呐图与导航状态融合的 PPO CNN 特征提取器。"""
+"""三路声呐 CNN 特征提取器与有界高斯 PPO 策略。"""
 import torch
 from torch import nn
+from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
@@ -25,8 +28,12 @@ class SonarCNNFeaturesExtractor(BaseFeaturesExtractor):
                 torch.zeros(1, *sonar_shape)
             ).shape[1]
 
-        state_dim = (observation_space.spaces["target"].shape[0]
-                     + observation_space.spaces["velocity"].shape[0])
+        self.state_keys = tuple(
+            key for key in ("target", "path", "velocity")
+            if key in observation_space.spaces
+        )
+        state_dim = sum(observation_space.spaces[key].shape[0]
+                        for key in self.state_keys)
         self.state_mlp = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.ReLU(),
@@ -41,6 +48,22 @@ class SonarCNNFeaturesExtractor(BaseFeaturesExtractor):
     def forward(self, observations):
         # 声呐距离在环境里已归一化到 [0, 1]，状态向量保持物理数值。
         sonar_features = self.sonar_cnn(observations["sonar"])
-        state = torch.cat((observations["target"], observations["velocity"]), dim=1)
+        state = torch.cat(tuple(observations[key] for key in self.state_keys), dim=1)
         state_features = self.state_mlp(state)
         return self.fusion(torch.cat((sonar_features, state_features), dim=1))
+
+
+class BoundedActorCriticPolicy(ActorCriticPolicy):
+    """PPO policy with a tanh-squashed Gaussian over the normalized action box.
+
+    Stable-Baselines3's default PPO Gaussian is unbounded and relies on the
+    environment to clip actions. That makes stored log-probabilities disagree
+    with the actions actually executed. This policy applies the tanh bijection
+    inside the distribution and includes its log-probability correction.
+    """
+
+    def _build(self, lr_schedule):
+        self.action_dist = SquashedDiagGaussianDistribution(
+            get_action_dim(self.action_space)
+        )
+        super()._build(lr_schedule)

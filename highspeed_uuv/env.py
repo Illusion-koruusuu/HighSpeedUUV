@@ -14,7 +14,9 @@ class DijkstraNavigationEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, dt=0.02, max_steps=2_500, obstacle_count=None,
-                 goal_guidance=False,
+                 goal_guidance=False, cruise_assist=True,
+                 include_path_observation=False,
+                 easy_rehearsal_probability=0.0,
                  dijkstra_resolution=2.0, vertical_cost_scale=1.0,
                  obstacle_count_range=(2, 5)):
         super().__init__()
@@ -39,15 +41,25 @@ class DijkstraNavigationEnv(gym.Env):
         # 每回合在范围内随机采样，障碍物之间不做排斥检查，因此允许重叠。
         self.obstacle_count = self.obstacle_count_min
         self.goal_guidance = bool(goal_guidance)
+        self.cruise_assist = bool(cruise_assist)
+        self.include_path_observation = bool(include_path_observation)
+        self.easy_rehearsal_probability = float(easy_rehearsal_probability)
+        if not 0.0 <= self.easy_rehearsal_probability <= 1.0:
+            raise ValueError("easy_rehearsal_probability must be in [0, 1]")
+        self.easy_rehearsal_goal_range = (25.0, 40.0)
+        self.goal_distance_range = (50.0, 70.0)
+        self.goal_yaw_limit = np.pi / 4.0
+        self.goal_pitch_limit = np.pi / 12.0
         self.reward_mode = "dijkstra"
         # At HoloOcean's 50 Hz step, the geodesic potential changes by only a
         # few hundredths of a metre after actuator lag.  Scale it before PPO
         # sees it so the navigation signal is not drowned by the terminal
         # reward and value-function noise.
         self.dijkstra_reward_scale = 10.0
-        self.dijkstra_reward_version = 11
+        self.dijkstra_reward_version = 12
         self.dijkstra_depth_weight = 15.0
         self.dijkstra_alignment_weight = 5.0
+        self.dijkstra_alignment_error_weight = 0.50
         # 终止项和逐步塑形奖励保持相近量级，避免 critic 只拟合成败标签。
         self.success_reward = 150.0
         self.collision_penalty = 300.0
@@ -113,12 +125,17 @@ class DijkstraNavigationEnv(gym.Env):
         # 动作仍为 [方向舵、水平舵、螺旋桨] 的归一化命令。
         self.action_space = spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
         # 声呐输入保留三路二维回波图，由 CNN 学习空间障碍特征。
-        self.observation_space = spaces.Dict({
+        observation_spaces = {
             "sonar": spaces.Box(0.0, 1.0, shape=self.sonar.observation_shape,
                                 dtype=np.float32),
             "target": spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
             "velocity": spaces.Box(-np.inf, np.inf, shape=(5,), dtype=np.float32),
-        })
+        }
+        if self.include_path_observation:
+            observation_spaces["path"] = spaces.Box(
+                -np.inf, np.inf, shape=(4,), dtype=np.float32
+            )
+        self.observation_space = spaces.Dict(observation_spaces)
 
     @staticmethod
     def _wrap_angle(angle):
@@ -157,9 +174,22 @@ class DijkstraNavigationEnv(gym.Env):
     def _sample_scene(self):
         """在前方扇区随机放置目标和静态障碍物，避免固定地图过拟合。"""
         # 每回合随机化场景，避免策略只记住固定地图。
-        goal_distance = self.np_random.uniform(50.0, 70.0)
-        goal_yaw = self.np_random.uniform(-np.pi / 4, np.pi / 4)
-        goal_pitch = self.np_random.uniform(-np.pi / 12, np.pi / 12)
+        rehearsal = (self.np_random.random()
+                     < self.easy_rehearsal_probability)
+        if rehearsal:
+            goal_distance = self.np_random.uniform(
+                *self.easy_rehearsal_goal_range
+            )
+            goal_yaw = self.np_random.uniform(-np.deg2rad(30.0),
+                                              np.deg2rad(30.0))
+            goal_pitch = self.np_random.uniform(-np.deg2rad(10.0),
+                                                np.deg2rad(10.0))
+        else:
+            goal_distance = self.np_random.uniform(*self.goal_distance_range)
+            goal_yaw = self.np_random.uniform(-self.goal_yaw_limit,
+                                              self.goal_yaw_limit)
+            goal_pitch = self.np_random.uniform(-self.goal_pitch_limit,
+                                                self.goal_pitch_limit)
         self.goal = np.array([
             goal_distance * np.cos(goal_pitch) * np.cos(goal_yaw),
             goal_distance * np.cos(goal_pitch) * np.sin(goal_yaw),
@@ -167,7 +197,7 @@ class DijkstraNavigationEnv(gym.Env):
         ])
 
         self.desired_surge = float(self.np_random.uniform(1.5, 2.5))
-        self.obstacle_count = int(self.np_random.integers(
+        self.obstacle_count = 0 if rehearsal else int(self.np_random.integers(
             self.obstacle_count_min, self.obstacle_count_max + 1
         ))
         self.obstacles = []
@@ -344,6 +374,16 @@ class DijkstraNavigationEnv(gym.Env):
         return (distance_progress, depth_progress, float(alignment_progress),
                 float(speed_shortfall))
 
+    def _navigation_alignment_error(self, observation):
+        """Penalize the current heading error, not only its change."""
+        key = "path" if "path" in observation else "target"
+        pitch_error = abs(float(observation[key][0]))
+        yaw_error = abs(float(observation[key][1]))
+        return float(np.clip(
+            0.7 * yaw_error / np.pi + 0.3 * pitch_error / (np.pi / 2.0),
+            0.0, 1.0,
+        ))
+
     def _capture_navigation_rewards(self, previous_position, position,
                                     observation, surge):
         """目标附近的末端捕获奖励，专门抑制等距绕圈。"""
@@ -388,7 +428,7 @@ class DijkstraNavigationEnv(gym.Env):
         return (float(total), float(alignment_reward),
                 float(radial_progress), float(radial_velocity_reward))
 
-    def observation_from_state(self, eta, nu):
+    def observation_from_state(self, eta, nu, planned_path=None):
         """由任意 NED 位姿和速度构造策略观测，供 HoloOcean 回放复用。"""
         sonar = self.sonar.observe(eta, self.obstacles)
 
@@ -409,11 +449,17 @@ class DijkstraNavigationEnv(gym.Env):
             target_surge - nu[0],
             normalized_distance,
         ])
-        return {
+        observation = {
             "sonar": sonar,
             "target": target.astype(np.float32),
             "velocity": nu[[0, 1, 2, 4, 5]].astype(np.float32),
         }
+        if self.include_path_observation:
+            observation["path"] = (
+                self._path_observation_from_path(eta, planned_path)
+                if planned_path is not None else self._path_observation(eta)
+            )
+        return observation
 
     def _is_avoiding(self, observation):
         """用近距离前向/舷侧回波判断是否确实需要即时避障。"""
@@ -436,8 +482,47 @@ class DijkstraNavigationEnv(gym.Env):
         action[2] = max(float(action[2]), minimum)
         return np.clip(action, -1.0, 1.0)
 
-    def _observe(self):
-        return self.observation_from_state(self.state.eta, self.state.nu)
+    def _path_observation(self, eta):
+        """Return local Dijkstra path direction and remaining path cost."""
+        if self._cost_field is None:
+            return np.zeros(4, dtype=np.float32)
+        path = self._plan_dijkstra_path(eta[:3], max_points=160)
+        return self._path_observation_from_path(eta, path)
+
+    def _path_observation_from_path(self, eta, path):
+        """Build path features from a previously extracted Dijkstra prefix."""
+        if len(path) < 2:
+            return np.zeros(4, dtype=np.float32)
+        point = np.asarray(eta[:3], dtype=float)
+        distances = np.linalg.norm(path - point, axis=1)
+        start = int(np.argmin(distances))
+        lookahead = path[-1]
+        for candidate in path[start:]:
+            if np.linalg.norm(candidate - point) >= 8.0:
+                lookahead = candidate
+                break
+        delta = lookahead - point
+        horizontal = float(np.hypot(delta[0], delta[1]))
+        target_pitch = float(np.arctan2(-delta[2], max(horizontal, 1e-6))
+                             - eta[4])
+        target_yaw = float(self._wrap_angle(
+            np.arctan2(delta[1], delta[0]) - eta[5]
+        ))
+        lookahead_distance = float(np.linalg.norm(delta))
+        remaining_cost = self._dijkstra_cost(point)
+        remaining_cost_norm = (float(np.clip(remaining_cost / 70.0, 0.0, 2.0))
+                               if np.isfinite(remaining_cost) else 2.0)
+        return np.array([
+            target_pitch,
+            target_yaw,
+            lookahead_distance / 10.0,
+            remaining_cost_norm,
+        ], dtype=np.float32)
+
+    def _observe(self, planned_path=None):
+        return self.observation_from_state(
+            self.state.eta, self.state.nu, planned_path=planned_path
+        )
 
     def _apply_goal_guidance(self, action, observation=None):
         """Bias clear-water commands toward the current goal direction."""
